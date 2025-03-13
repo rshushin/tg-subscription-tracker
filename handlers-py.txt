@@ -1,0 +1,757 @@
+import logging
+import asyncio
+from datetime import datetime
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ContextTypes, ConversationHandler
+
+# Import models and config
+from models import User, Session
+from config import (
+    MESSAGES, ADMIN_IDS, GROUP_ID, 
+    MAIN_MENU_KEYBOARD, EMAIL_INPUT, CONFIRM_EMAIL
+)
+
+# Import other modules
+from modules.payment_integration import (
+    verify_subscription_by_email, generate_ainox_unsubscribe_link, 
+    WixSubscriptionManager, schedule_subscription_sync,
+    WIX_API_KEY, WIX_SITE_ID
+)
+
+# Configure logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Core command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    
+    # Add or update user in database
+    db_session = Session()
+    db_user = db_session.query(User).filter_by(telegram_id=user.id).first()
+    
+    if not db_user:
+        db_user = User(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            language_code=user.language_code
+        )
+        db_session.add(db_user)
+    
+    db_session.commit()
+    db_session.close()
+    
+    # Create inline keyboard with the requested options, including unsubscribe
+    keyboard = [
+        [InlineKeyboardButton("Да, я продолжаю, у меня есть подписка", callback_data="has_subscription")],
+        [InlineKeyboardButton("Хочу продолжить, но у меня нет подписки", callback_data="need_subscription")],
+        [InlineKeyboardButton("Я не знаю, есть ли у меня подписка", callback_data="check_subscription")],
+        [InlineKeyboardButton("Нет, хочу отписаться", callback_data="want_to_unsubscribe")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send the welcome message with buttons
+    await update.message.reply_text(
+        MESSAGES['start'],
+        reply_markup=reply_markup
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    await update.message.reply_text(
+        MESSAGES['help'],
+        reply_markup=MAIN_MENU_KEYBOARD
+    )
+
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process the subscribe command."""
+    keyboard = [
+        [
+            InlineKeyboardButton(MESSAGES['subscribe_international'], callback_data="payment_international"),
+            InlineKeyboardButton(MESSAGES['subscribe_russian'], callback_data="payment_russian"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        MESSAGES['subscribe_prompt'], 
+        reply_markup=reply_markup
+    )
+
+async def check_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check subscription status."""
+    user_id = update.effective_user.id
+    db_session = Session()
+    db_user = db_session.query(User).filter_by(telegram_id=user_id).first()
+    
+    if not db_user:
+        await update.message.reply_text(
+            MESSAGES['no_subscription'],
+            reply_markup=MAIN_MENU_KEYBOARD
+        )
+        db_session.close()
+        return
+    
+    # If the user has an email, verify current subscription status with payment systems
+    if db_user.email:
+        try:
+            is_subscribed, subscription_info = await verify_subscription_by_email(db_user.email)
+            
+            if is_subscribed:
+                # Update database with fresh subscription info
+                db_user.subscription_status = 'active'
+                if subscription_info.get('end_date'):
+                    db_user.subscription_end_date = subscription_info['end_date']
+                db_user.is_russian_card = subscription_info.get('payment_method') == 'russian'
+                db_session.commit()
+                
+                formatted_date = db_user.subscription_end_date.strftime('%d.%m.%Y') if db_user.subscription_end_date else "неизвестная дата"
+                await update.message.reply_text(
+                    MESSAGES['subscription_active'].format(formatted_date),
+                    reply_markup=MAIN_MENU_KEYBOARD
+                )
+    
+    db_session.close()
+
+# Admin command handlers
+async def admin_update_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to update subscription status."""
+    # Check if user is admin
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    
+    try:
+        # Format: /update_sub user_id is_subscribed months
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("Использование: /update_sub user_id is_subscribed [months]")
+            return
+        
+        user_id = int(args[0])
+        is_subscribed = args[1].lower() in ('yes', 'true', '1')
+        months = int(args[2]) if len(args) > 2 else 1
+        
+        await process_subscription_update(user_id, is_subscribed, months)
+        await update.message.reply_text(f"Подписка пользователя {user_id} обновлена.")
+    
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
+async def process_subscription_update(telegram_id: int, is_subscribed: bool, months: int = 1) -> None:
+    """Process subscription update (Admin function to update subscription status)."""
+    db_session = Session()
+    db_user = db_session.query(User).filter_by(telegram_id=telegram_id).first()
+    
+    if not db_user:
+        logger.error(f"User with telegram_id {telegram_id} not found")
+        db_session.close()
+        return
+    
+    if is_subscribed:
+        db_user.subscription_status = 'active'
+        if db_user.subscription_end_date and db_user.subscription_end_date > datetime.now():
+            # Extend existing subscription
+            db_user.subscription_end_date += timedelta(days=30 * months)
+        else:
+            # New subscription
+            db_user.subscription_end_date = datetime.now() + timedelta(days=30 * months)
+    else:
+        db_user.subscription_status = 'expired'
+    
+    db_session.commit()
+    db_session.close()
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to broadcast a message to all users."""
+    # Check if user is admin
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    
+    # Extract message text
+    if not context.args:
+        await update.message.reply_text("Пожалуйста, укажите текст сообщения после команды.")
+        return
+    
+    message_text = ' '.join(context.args)
+    
+    # Get all users from the database
+    db_session = Session()
+    all_users = db_session.query(User).all()
+    
+    sent_count = 0
+    failed_count = 0
+    
+    # Send progress message
+    progress_msg = await update.message.reply_text(f"Начинаю рассылку сообщения {len(all_users)} пользователям...")
+    
+    # Send message to each user
+    for user in all_users:
+        try:
+            await context.bot.send_message(
+                chat_id=user.telegram_id,
+                text=message_text,
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+            sent_count += 1
+            
+            # Update progress every 10 users
+            if sent_count % 10 == 0:
+                await progress_msg.edit_text(f"Отправлено: {sent_count}/{len(all_users)}, Ошибок: {failed_count}")
+                
+            # Delay to prevent hitting rate limits
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            logger.error(f"Failed to send broadcast to {user.telegram_id}: {e}")
+            failed_count += 1
+    
+    # Send final results
+    await progress_msg.edit_text(f"Рассылка завершена. Отправлено: {sent_count}, Ошибок: {failed_count}")
+    
+    # Alternatively, send a message to the group
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=message_text
+        )
+        logger.info(f"Broadcast message sent to group")
+    except Exception as e:
+        logger.error(f"Failed to send broadcast to group: {e}")
+    
+    db_session.close()
+
+async def admin_schedule_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to broadcast immediately"""
+    # Check if user is admin
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    
+    # Schedule the job to run in 5 seconds
+    job = context.job_queue.run_once(send_broadcast_to_all, 5)
+    
+    await update.message.reply_text("Рассылка стартового сообщения всем пользователям будет выполнена через 5 секунд.")
+
+async def admin_sync_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to manually sync subscriptions from payment systems."""
+    # Check if user is admin
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+    
+    await update.message.reply_text("Начинаю синхронизацию подписок с платежными системами...")
+    
+    try:
+        await schedule_subscription_sync(context)
+        await update.message.reply_text("Синхронизация успешно завершена!")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при синхронизации: {e}")
+
+# Other handlers
+async def send_broadcast_to_all(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the start message to the group"""
+    start_message = MESSAGES['start'] + "\n\nЧтобы продолжить, напишите боту в личные сообщения."
+
+    logger.info("Sending broadcast to group")
+    
+    # Send to the group
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=start_message
+        )
+        logger.info("Successfully sent message to group")
+    except Exception as e:
+        logger.error(f"Failed to send to group: {e}")
+    
+    logger.info("Broadcast completed")
+
+async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send subscription reminders to users."""
+    now = datetime.now()
+    db_session = Session()
+    
+    try:
+        # New users with no subscription
+        new_users = db_session.query(User).filter_by(subscription_status='none').all()
+        for user in new_users:
+            # Send reminder only once a week
+            if not user.last_reminder_sent or (now - user.last_reminder_sent).days >= 7:
+                try:
+                    # Try to send private message first
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=MESSAGES['reminder_new'],
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Оформить подписку", callback_data="payment_international")
+                            ]]),
+                        )
+                        # Add main menu keyboard in a separate message
+                        await context.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text="Используйте меню для навигации:",
+                            reply_markup=MAIN_MENU_KEYBOARD
+                        )
+                        user.last_reminder_sent = now
+                    except Exception as e:
+                        # If private message fails, mention user in the group
+                        logger.error(f"Failed to send private message to {user.telegram_id}: {e}")
+                        try:
+                            await context.bot.send_message(
+                                chat_id=GROUP_ID,
+                                text=f"@{user.username or user.first_name}, {MESSAGES['reminder_new']}",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("Оформить подписку", callback_data="payment_international")
+                                ]])
+                            )
+                            user.last_reminder_sent = now
+                        except Exception as e2:
+                            logger.error(f"Failed to mention user in group: {e2}")
+                except Exception as e:
+                    logger.error(f"Failed to send any reminder to {user.telegram_id}: {e}")
+        
+        # Users with active subscription expiring in 7 days
+        expiring_soon = db_session.query(User).filter_by(subscription_status='active').all()
+        for user in expiring_soon:
+            if user.subscription_end_date and (user.subscription_end_date - now).days <= 7:
+                # Only send reminder once every 2 days
+                if not user.last_reminder_sent or (now - user.last_reminder_sent).days >= 2:
+                    try:
+                        formatted_date = user.subscription_end_date.strftime('%d.%m.%Y')
+                        # Try private message first
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user.telegram_id,
+                                text=MESSAGES['reminder_renew'].format(formatted_date),
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("Продлить подписку", callback_data="payment_international" if not user.is_russian_card else "payment_russian")
+                                ]])
+                            )
+                            # Send menu keyboard in a separate message
+                            await context.bot.send_message(
+                                chat_id=user.telegram_id,
+                                text="Используйте меню для навигации:",
+                                reply_markup=MAIN_MENU_KEYBOARD
+                            )
+                            user.last_reminder_sent = now
+                        except Exception as e:
+                            # If private message fails, mention user in the group
+                            logger.error(f"Failed to send private message to {user.telegram_id}: {e}")
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=GROUP_ID,
+                                    text=f"@{user.username or user.first_name}, {MESSAGES['reminder_renew'].format(formatted_date)}",
+                                    reply_markup=InlineKeyboardMarkup([[
+                                        InlineKeyboardButton("Продлить подписку", callback_data="payment_international" if not user.is_russian_card else "payment_russian")
+                                    ]])
+                                )
+                                user.last_reminder_sent = now
+                            except Exception as e2:
+                                logger.error(f"Failed to mention user in group: {e2}")
+                    except Exception as e:
+                        logger.error(f"Failed to send any reminder to {user.telegram_id}: {e}")
+        
+        # Users with expired subscription
+        expired = db_session.query(User).filter_by(subscription_status='expired').all()
+        for user in expired:
+            # Send reminder once a week
+            if not user.last_reminder_sent or (now - user.last_reminder_sent).days >= 7:
+                try:
+                    # Try private message first
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=MESSAGES['reminder_expired'],
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("Возобновить подписку", callback_data="payment_international" if not user.is_russian_card else "payment_russian")
+                            ]])
+                        )
+                        # Send menu keyboard in a separate message
+                        await context.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text="Используйте меню для навигации:",
+                            reply_markup=MAIN_MENU_KEYBOARD
+                        )
+                        user.last_reminder_sent = now
+                    except Exception as e:
+                        # If private message fails, mention user in the group
+                        logger.error(f"Failed to send private message to {user.telegram_id}: {e}")
+                        try:
+                            await context.bot.send_message(
+                                chat_id=GROUP_ID,
+                                text=f"@{user.username or user.first_name}, {MESSAGES['reminder_expired']}",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("Возобновить подписку", callback_data="payment_international" if not user.is_russian_card else "payment_russian")
+                                ]])
+                            )
+                            user.last_reminder_sent = now
+                        except Exception as e2:
+                            logger.error(f"Failed to mention user in group: {e2}")
+                except Exception as e:
+                    logger.error(f"Failed to send any reminder to {user.telegram_id}: {e}")
+        
+        # Check for expired subscriptions and update their status
+        active_users = db_session.query(User).filter_by(subscription_status='active').all()
+        for user in active_users:
+            if user.subscription_end_date and user.subscription_end_date < now:
+                user.subscription_status = 'expired'
+    
+    except Exception as e:
+        logger.error(f"Error in send_reminders: {e}")
+    
+    db_session.commit()
+    db_session.close()
+
+async def check_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check for new members who joined the group."""
+    if not update.message or not update.message.new_chat_members:
+        return
+    
+    for new_member in update.message.new_chat_members:
+        if not new_member.is_bot:
+            db_session = Session()
+            db_user = db_session.query(User).filter_by(telegram_id=new_member.id).first()
+            
+            if not db_user:
+                db_user = User(
+                    telegram_id=new_member.id,
+                    username=new_member.username,
+                    first_name=new_member.first_name,
+                    last_name=new_member.last_name,
+                    language_code=new_member.language_code
+                )
+                db_session.add(db_user)
+                db_session.commit()
+                
+                # Send welcome message with subscription info
+                try:
+                    await context.bot.send_message(
+                        chat_id=new_member.id,
+                        text=f"{MESSAGES['start']}\n\n{MESSAGES['reminder_new']}",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("Оформить подписку", callback_data="payment_international")
+                        ]])
+                    )
+                    # Send menu keyboard in a separate message
+                    await context.bot.send_message(
+                        chat_id=new_member.id,
+                        text="Используйте меню для навигации:",
+                        reply_markup=MAIN_MENU_KEYBOARD
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send welcome message to {new_member.id}: {e}")
+            
+            db_session.close()
+
+async def setup_commands_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job to set up bot commands menu."""
+    commands = [
+        ("start", "Начать взаимодействие с ботом"),
+        ("subscribe", "Оформить подписку"),
+        ("status", "Проверить статус подписки"),
+        ("cancel", "Отменить подписку"),
+        ("link_email", "Привязать email для автоматического отслеживания подписки"),
+        ("help", "Получить список доступных команд")
+    ]
+    
+    try:
+        await context.bot.set_my_commands(commands)
+        logger.info("Bot commands menu has been set up")
+    except Exception as e:
+        logger.error(f"Error setting up command menu: {e}")
+
+            else:
+                # Reset subscription status if no active subscription found
+                db_user.subscription_status = 'none'
+                db_user.subscription_end_date = None
+                db_session.commit()
+                
+                await update.message.reply_text(
+                    f"Активной подписки не найдено для email {db_user.email}. Используйте /subscribe для оформления.",
+                    reply_markup=MAIN_MENU_KEYBOARD
+                )
+        except Exception as e:
+            logger.error(f"Error verifying subscription: {e}")
+            # Fall back to database check if verification fails
+            await check_subscription_from_db(update, db_user, db_session)
+    else:
+        # No email linked, check subscription from database
+        await check_subscription_from_db(update, db_user, db_session)
+    
+    db_session.close()
+
+async def check_subscription_from_db(update, db_user, db_session):
+    """Check subscription status using database information"""
+    if db_user.subscription_end_date:
+        formatted_date = db_user.subscription_end_date.strftime('%d.%m.%Y')
+        
+        # Check if end date is in the future
+        if db_user.subscription_end_date > datetime.now():
+            # Update status to active if not already
+            if db_user.subscription_status != 'active':
+                db_user.subscription_status = 'active'
+                db_session.commit()
+            
+            await update.message.reply_text(
+                MESSAGES['subscription_active'].format(formatted_date),
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+        else:
+            # Update status to expired if not already
+            if db_user.subscription_status != 'expired':
+                db_user.subscription_status = 'expired'
+                db_session.commit()
+                
+            await update.message.reply_text(
+                MESSAGES['subscription_expired'].format(formatted_date),
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+    else:
+        await update.message.reply_text(
+            MESSAGES['no_subscription'],
+            reply_markup=MAIN_MENU_KEYBOARD
+        )
+
+async def cancel_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel subscription."""
+    user_id = update.effective_user.id
+    db_session = Session()
+    db_user = db_session.query(User).filter_by(telegram_id=user_id).first()
+    
+    if not db_user or db_user.subscription_status != 'active':
+        await update.message.reply_text(
+            MESSAGES['no_subscription'],
+            reply_markup=MAIN_MENU_KEYBOARD
+        )
+    else:
+        keyboard = [
+            [InlineKeyboardButton("Отменить подписку", callback_data="cancel_subscription")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Вы уверены, что хотите отменить подписку?", 
+            reply_markup=reply_markup
+        )
+    
+    db_session.close()
+
+# Button callback handler
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process callback queries from inline buttons."""
+    query = update.callback_query
+    logger.info(f"Button pressed: {query.data}")
+    
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.warning(f"Error answering callback query: {e}")
+       
+    user_id = query.from_user.id
+    db_session = Session()
+    db_user = db_session.query(User).filter_by(telegram_id=user_id).first()
+    
+    # Handle the start menu options
+    if query.data == "has_subscription":
+        # User claims to have a subscription - check if that's true
+        if db_user and db_user.subscription_status == 'active':
+            # Check if subscription ends this month
+            current_month = datetime.now().month
+            current_year = datetime.now().year
+            
+            if (db_user.subscription_end_date.month == current_month and 
+                db_user.subscription_end_date.year == current_year):
+                # Subscription ends this month, prompt for renewal
+                formatted_date = db_user.subscription_end_date.strftime('%d.%m.%Y')
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"Ваша подписка действительно активна, но заканчивается в этом месяце ({formatted_date}). Хотите продлить?",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(MESSAGES['subscribe_international'], callback_data="payment_international"),
+                         InlineKeyboardButton(MESSAGES['subscribe_russian'], callback_data="payment_russian")]
+                    ])
+                )
+            else:
+                # Subscription extends beyond current month
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="Отлично! Ваша подписка действительно активна. Ждем вас на новом цикле!",
+                    reply_markup=MAIN_MENU_KEYBOARD
+                )
+        else:
+            # User thinks they have a subscription but we don't have it recorded
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Наша система не показывает активную подписку на ваш аккаунт. Пожалуйста, используйте команду /link_email, чтобы связать ваш email с аккаунтом Telegram, или выполните команду /status для проверки статуса подписки.",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+    
+    elif query.data == "need_subscription":
+        # User wants to subscribe - show subscription options
+        keyboard = [
+            [
+                InlineKeyboardButton(MESSAGES['subscribe_international'], callback_data="payment_international"),
+                InlineKeyboardButton(MESSAGES['subscribe_russian'], callback_data="payment_russian"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=MESSAGES['subscribe_prompt'],
+            reply_markup=reply_markup
+        )
+    
+    elif query.data == "check_subscription":
+        # User wants to check subscription status
+        if not db_user:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=MESSAGES['no_subscription'],
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+        elif db_user.subscription_end_date:
+            formatted_date = db_user.subscription_end_date.strftime('%d.%m.%Y')
+            
+            # Check if end date is in the future
+            if db_user.subscription_end_date > datetime.now():
+                # Update status to active if not already
+                if db_user.subscription_status != 'active':
+                    db_user.subscription_status = 'active'
+                    db_session.commit()
+                
+                # Check if subscription ends this month
+                current_month = datetime.now().month
+                current_year = datetime.now().year
+                
+                if (db_user.subscription_end_date.month == current_month and 
+                    db_user.subscription_end_date.year == current_year):
+                    # Prompt for renewal
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=MESSAGES['subscription_active'].format(formatted_date) + " Подписка заканчивается в этом месяце. Хотите продлить?",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(MESSAGES['subscribe_international'], callback_data="payment_international"),
+                             InlineKeyboardButton(MESSAGES['subscribe_russian'], callback_data="payment_russian")]
+                        ])
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=MESSAGES['subscription_active'].format(formatted_date),
+                        reply_markup=MAIN_MENU_KEYBOARD
+                    )
+            else:
+                # Update status to expired if not already
+                if db_user.subscription_status != 'expired':
+                    db_user.subscription_status = 'expired'
+                    db_session.commit()
+                    
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=MESSAGES['subscription_expired'].format(formatted_date),
+                    reply_markup=MAIN_MENU_KEYBOARD
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=MESSAGES['no_subscription'],
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+            
+    elif query.data == "want_to_unsubscribe":
+        # User wants to unsubscribe
+        if not db_user or db_user.subscription_status != 'active':
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="У вас нет активной подписки для отмены.",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+        else:
+            # Show cancellation options
+            keyboard = [
+                [InlineKeyboardButton("Отменить подписку", callback_data="cancel_subscription")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Вы уверены, что хотите отменить вашу подписку?",
+                reply_markup=reply_markup
+            )
+    
+    # Handle payment and subscription options
+    elif query.data == "payment_international":
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=MESSAGES['payment_international'] + "\n\n" + MESSAGES['link_email_request'],
+            reply_markup=MAIN_MENU_KEYBOARD
+        )
+        if db_user:
+            db_user.is_russian_card = False
+            db_session.commit()
+    
+    elif query.data == "payment_russian":
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=MESSAGES['payment_russian'] + "\n\n" + MESSAGES['link_email_request'],
+            reply_markup=MAIN_MENU_KEYBOARD
+        )
+        if db_user:
+            db_user.is_russian_card = True
+            db_session.commit()
+    
+    elif query.data == "cancel_subscription":
+        # Check if user has a linked email first
+        if not db_user or not db_user.email:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Для отмены подписки необходимо сначала привязать вашу почту командой /link_email, затем повторить отмену подписки.",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+            db_session.close()
+            return
+            
+        # Check if user has active subscription and linked email
+        if db_user.subscription_status != 'active':
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="У вас нет активной подписки для отмены.",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+            db_session.close()
+            return
+            
+        # Check if email has a Wix subscription
+        wix_manager = WixSubscriptionManager(WIX_API_KEY, WIX_SITE_ID)
+        wix_orders = wix_manager.get_purchased_plans()
+        
+        has_wix_subscription = False
+        for order in wix_orders:
+            subscriber_info = wix_manager.get_subscriber_info(order)
+            if (subscriber_info and 
+                subscriber_info.get('email', '').lower().strip() == db_user.email.lower().strip()):
+                logger.info(f"Found Wix subscription for user {user_id} with email {db_user.email}")
+                has_wix_subscription = True
+                break
+        
+        if has_wix_subscription:
+            # Found a Wix subscription - use the international cancellation method
+            logger.info(f"Using international cancellation method for user {user_id}")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="Для отмены подписки отправьте email на адрес: anandagetaway@gmail.com\n\nУкажите в теме письма 'Subscription Cancellation'.",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
+        else:
+            # No Wix subscription found, try Ainox
+            logger.info(f"Using Ainox cancellation method for user {user_id}")
+            unsubscribe_link = generate_ainox_unsubscribe_link(db_user.email)
+            
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"Для отмены подписки российской картой перейдите по персональной ссылке:\n{unsubscribe_link}",
+                reply_markup=MAIN_MENU_KEYBOARD
+            )
