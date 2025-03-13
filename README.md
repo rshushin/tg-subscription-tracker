@@ -12,6 +12,12 @@ A Telegram bot that manages user subscriptions with integration for payment syst
 - Admin broadcast functionality
 - Multi-language support (currently Russian)
 
+## Localization
+
+- The current implementation uses Russian for all user-facing messages
+- All bot commands and responses are in Russian
+- To change the language, modify the messages in `config.py`
+
 ## Project Structure
 
 ```
